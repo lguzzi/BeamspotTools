@@ -3,13 +3,16 @@ from __future__ import print_function
 import sys
 assert sys.version_info.major>2, "This script requires python 3+"
 import os
-assert os.system("auth-get-sso-cookie --help &> /dev/null")==0, "auth-get-sso-cookie must be installed. You should run this script on lxplus"
+assert os.system("auth-get-sso-cookie --help &> /dev/null")==0, "auth-get-sso-cookie must be installed.\n\
+Run this script from lxplus or download auth-get-sso-cookie from \
+https://gitlab.cern.ch/authzsvc/tools/auth-get-sso-cookie \
+and add it to your PATH. Don'\t run from a CMSSW envuronment."
 import time
 import json
 import requests
-import http.cookiejar as cookielib
-import multiprocessing as mp
-
+import http.cookiejar   as cookielib
+import multiprocessing  as mp
+from collections import OrderedDict
 import argparse
 parser = argparse.ArgumentParser('''
 This script fetches information about stable proton fills form OMS and saves them in a txt file.
@@ -19,6 +22,7 @@ parser.add_argument('-u', '--update'         , default=None                     
 parser.add_argument('-o', '--output'         , default='output.txt'             , help="Output file"                                  , type=str)
 parser.add_argument('-s', '--streams'        , default=max(mp.cpu_count()-4, 1) , help="Number of streams to use for fetching data"   , type=int)
 parser.add_argument('-S', '--size'           , default=100                      , help="Number of fills to fetch with a single stream", type=int)
+parser.add_argument(      '--old'            , action='store_true'              , help="Save results in the old tabular .txt format"  )
 args = parser.parse_args()
 
 def get_cookie(url):
@@ -95,11 +99,11 @@ with mp.Pool(args.streams) as pool:
 
 if args.update is not None:
   with open(args.update, 'r') as ifile:
-    oldmessage = [l.strip('\n') for l in ifile.readlines()[1:]]
-    oldfills   = [int(l.split('\t')[0]) for l in oldmessage if len(l)]
+    oldmessage = [l.strip('\n') for l in ifile.readlines()[1:]]         if args.old else json.load(ifile, object_pairs_hook=OrderedDict)
+    oldfills   = [int(l.split('\t')[0]) for l in oldmessage if len(l)]  if args.old else oldmessage.keys()
 else:
   oldfills    = []
-  oldmessage  = []
+  oldmessage  = [] if args.old else {}
 
 fills = [f for fetch in fetched for f in fetch if f['fill_number'] not in oldfills]
 print('[INFO]', len(fills), 'fills fetched.')
@@ -135,10 +139,20 @@ header_map = {
   'Runs'              : lambda dic: dic['runs']                           ,
   'Comments'          : lambda dic: ''                                    ,
 }
-
-header      = ['\t'.join(header_map.keys())]
-newmessage  = ['\t'.join([str(val(fill)) for val in header_map.values()]) for fill in fills]
-message     = '\n'.join(header+newmessage+oldmessage)
+json_keys = ['b_field', 'bunches_beam1', 'bunches_beam2', 'bunches_colliding', 'bunches_target', 'crossing_angle', 'delivered_lumi', 'duration', 'efficiency_lumi', 'efficiency_time', 'end_stable_beam', 'energy', 'fill_type_runtime', 'injection_scheme', 'intensity_beam1', 'intensity_beam2', 'peak_lumi', 'peak_pileup', 'peak_specific_lumi', 'recorded_lumi', 'runs', 'start_stable_beam', 'start_time', 'to_ready_time']
+if args.old:
+  header      = ['\t'.join(header_map.keys())]
+  newmessage  = ['\t'.join([str(val(fill)) for val in header_map.values()]) for fill in fills]
+  message     = '\n'.join(header+newmessage+oldmessage)
+else:
+  newmessage = OrderedDict()
+  for f in fills:
+    newmessage[f['fill_number']] = {k: f[k] for k in json_keys}
+  oldmessage.update(newmessage)
+  message = oldmessage
 
 with open(args.output, 'w') as ofile:
-  ofile.write(message)
+  if args.old:
+    ofile.write(message)
+  else:
+    json.dump(message,ofile,indent=4)
