@@ -70,8 +70,22 @@ options.register('saveRootFile', False              ,
     VarParsing.VarParsing.varType.bool              ,
     "save the fit result also in root file (debug)" ,
 )
-options.parseArguments()
+options.register('selectBx', None                   ,
+    VarParsing.VarParsing.multiplicity.singleton    ,
+    VarParsing.VarParsing.varType.int               ,
+    "fit only the selected bunch crossing.\
+For VdM scans. To be used with the correct CMSSW branch.\
+https://github.com/MilanoBicocca-pix/cmssw/wiki/Notes-for-BS-fit-on-VdM-scans" ,
+)
+options.register('timerange', []                    ,
+    VarParsing.VarParsing.multiplicity.list         ,
+    VarParsing.VarParsing.varType.int               ,
+    "fit only in the selected time range [min,max].\
+For VdM scans. To be used with the correct CMSSW branch.\
+https://github.com/MilanoBicocca-pix/cmssw/wiki/Notes-for-BS-fit-on-VdM-scans" ,
+)
 
+options.parseArguments()
 # fetch the file list from the dataset using dasgoclient or from an input
 if options.inputFiles==['']:
     runranges = get_run_ranges(options.runs)
@@ -169,6 +183,14 @@ if options.highPurity:
     d0_phi_analyzer_cff.PVFitter.useOnlyFirstPV     = True
     d0_phi_analyzer_cff.PVFitter.minSumPt           = 50.0
     d0_phi_analyzer_cff.PVFitter.minVertexNTracks   = 30
+
+if options.selectBx is not None:
+    assert options.selectBx > 0,                        "The bunch crossing must be a positive integer"
+    process.d0_phi_analyzer.BeamFitter.selectBx = cms.untracked.vint32(options.selectBx)
+if len(options.timerange):
+    assert len(options.timerange)==2,                   "timerange must contain two values, {} were given".format(len(options.timerange))
+    assert options.timerange[0]<options.timerange[1],   "timerange is inverted"
+    process.d0_phi_analyzer.BeamFitter.timerange = cms.untracked.vdouble(*options.timerange)
 
 process.p = cms.Path(   
     process.offlineBeamSpot                        + 
