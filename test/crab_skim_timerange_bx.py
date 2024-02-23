@@ -1,15 +1,17 @@
 from CRABClient.UserUtilities import config as Configuration
 from CRABAPI.RawCommand import crabCommand
 
-import os
+import os, sys
 import json
 import argparse
 parser = argparse.ArgumentParser('''Submit jobs to skim events for VdM tasks.\n
 The script reads time ranges, run ranges and lumisections from LUMI json files. 
 The bunch crossings list is provided as an external argument.\n
 Each submission should correspond to a single dataset and a single VdM configuration (json file).\n
+The crab task is created block-wise to reduce the tape-recall time.\n
 The output consists of events falling in the time ranges specified in the json file, 
-matching the given bunch crossing numbers.
+matching the given bunch crossing numbers.\n
+[!] the output is saved in /store/user/$USER/BeamSpot/
 ''')
 parser.add_argument('--input'         , required=True             , help='timestamp file from lumi')
 parser.add_argument('--storage'       , default='T3_IT_MIB'       , help='storage site')
@@ -17,6 +19,8 @@ parser.add_argument('--dataset'       , required=True             , help='input 
 parser.add_argument('--bunchcrossings', required=True             , help='list of bunchcrossings to select', nargs='+')
 parser.add_argument('--workarea'      , default='TimeBX_skim'     , help='crab work area')
 parser.add_argument('--dryrun'        , action='store_true'       , help='don\'t run CRAB')
+parser.add_argument('--streams'       , default=10, type=int      , help='number of streams for fetching the block list')
+
 args = parser.parse_args()
 
 class Scan:
@@ -28,25 +32,16 @@ class Scan:
     self.main   = json
     self.index  = number
     self.scan   = self.main['Scans'][self.index]
-    self.fill   = self.main['Fill'     ]
-    self.runn   = self.main['Run'      ][self.index]
-    self.stype  = self.main['ScanTypes'][self.index]
-    self.sname  = self.main['ScanNames'][self.index]
-    self.name   = '_'.join([
-      self.label, 
-      str(self.fill), 
-      str(self.runn), 
-      self.stype, 
-      self.sname])
+    self.runn   = self.main['Run'  ][self.index]
     self.points = [Point(scan=self, index=i) for i in range(self.scan['NumPoints'])]
-    self.runs   = ','.join(p.runs   for p in self.points)
     self.times  = ','.join(p.times  for p in self.points)
 
 class Point:
   ''' class for building a scan point object. 
   A Point instance identifies a beam step in a scan effort.
   '''
-  QUERYBLOCK = 'dasgoclient --query="block run={R} dataset={D}"'
+  QUERYFILE         = 'dasgoclient --query=\"file dataset={D} run={R} lumi={L}\"'
+  QUERYBLOCK_BYFILE = 'dasgoclient --query=\"block file={F}\"'
   def __init__(self, scan, index):
     self.scan     = scan
     self.index    = index
@@ -54,23 +49,37 @@ class Point:
     self.lumie    = self.scan.scan['LSStopTimes' ][self.index]
     self.timeb    = self.scan.scan['StartTimes'  ][self.index]
     self.timee    = self.scan.scan['StopTimes'   ][self.index]
-    self.runs     = '{R}:{B}-{R}:{E}'.format(R=self.scan.runn, B=self.lumib, E=self.lumie)
+    self.lumis    = set([l for l in range(self.lumib, self.lumie+1)])
     self.times    = '{B}:{E}'.format(B=self.timeb, E=self.timee)
-    self.name     = '_'.join([
-      self.scan.name,
-      str(self.lumib),
-      str(self.lumie),
-      str(self.index)])
-    self.blocks   = self.get_blocks()
-  def get_blocks(self):
-    return [l.strip('\n') for l in os.popen(Point.QUERYBLOCK.format(R=self.scan.runn, D=args.dataset))]
+
+def popen(cmd): return tuple(l.strip('\n') for l in os.popen(cmd).readlines())
+def fetch_blocks(points):
+  ''' Qeries needed files (by dataset, run and lumi) from DAS.\n
+  Use the file list to query the needed blocks.'''
+  from multiprocessing import Pool
+  pool = Pool(args.streams)
+  FILES   = 'dasgoclient --query="file dataset={D} run={R} lumi={L}"'
+  BLOCKS  = 'dasgoclient --query="block file={F}"'
+  SIZE    = 'dasgoclient --query="block={B} | grep block.size"'
+
+  sys.stdout.write("Fetching blocks...") ; sys.stdout.flush()
+  queriesF  = list(set([FILES.format(D=args.dataset, R=p.scan.runn, L=l) for p in points for l in p.lumis]))
+  files     = set(_ for f in pool.map(popen, queriesF) for _ in f)
+  queriesB  = [BLOCKS.format(F=f) for f in files]
+  blocks    = set(_ for b in pool.map(popen, queriesB) for _ in b)
+  queriesS  = [SIZE.format(B=b) for b in blocks]
+  size      = sum([int(_) for s in pool.map(popen, queriesS) for _ in s])
+  sys.stdout.write("\rFetching blocks...done\n") ; sys.stdout.flush()
+  print('''{F} files found, {B} blocks will be added to the crab task ({S} GB)'''.format(F=len(files), B=len(blocks), S=size>>30))
+  return blocks
 
 lumijson  = json.load(open(args.input, 'r'))
 scans     = [Scan(label=os.path.basename(args.input).strip('.json'), json=lumijson, number=s['ScanNumber']-1) for s in lumijson['Scans']]
-import pdb; pdb.set_trace()
+points    = [p for s in scans for p in s.points]
+
 JOBNAME     = '_'.join([args.dataset.split('/')[1], os.path.basename(args.input).strip('.json')])
-RUNSTRING   = ','.join(s.runs   for s in scans)
-TIMESTRING  = ','.join(s.times  for s in scans)
+RUNSTRING   = ','.join(str(s.runn)  for s in scans)
+TIMESTRING  = ','.join(s.times      for s in scans)
 BUNCHSTRING = ','.join(b for b in args.bunchcrossings)
 OUTPUT      = '/store/user/{}/BeamSpot/'.format(os.environ['USER'])
 
@@ -88,9 +97,11 @@ config.Data.inputDataset        = args.dataset
 config.Data.runRange            = RUNSTRING
 config.Site.storageSite         = args.storage
 config.JobType.psetName         = 'EventSkimming_byTime_byBX.py'
+config.Data.outLFNDirBase       = '/store/user/{U}/BeamSpot'.format(U=os.environ['USER'])
+config.Data.inputBlocks         = list(fetch_blocks(points))
 config.JobType.pyCfgParams = [
   "bunchcrossing={}".format(BUNCHSTRING),
   "timerange={}"    .format(TIMESTRING) ,
 ]
-#config.Data.outLFNDirBase       = '/
+
 crabCommand('submit', config=config, dryrun=args.dryrun)
